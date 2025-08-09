@@ -8,6 +8,8 @@ SMBClient::SMBClient() {
     sessionID = 0;
     treeID = 0;
     negotiatedDialect = 0;
+    virtualDiskOpen = false;
+    memset(virtualDiskFileId, 0, sizeof(virtualDiskFileId));
 }
 
 SMBClient::~SMBClient() {
@@ -473,4 +475,370 @@ void SMBClient::end() {
 
 bool SMBClient::isConnected() {
     return client.connected() && authenticated;
+}
+
+bool SMBClient::readSector(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    if (!authenticated || !virtualDiskOpen) {
+        // Try to open virtual disk file if not already open
+        if (!openVirtualDiskFile()) {
+            Serial.println("SMB2: Cannot open virtual disk file for reading");
+            return false;
+        }
+    }
+    
+    // Calculate absolute offset in the virtual disk file
+    uint64_t absoluteOffset = (uint64_t)lba * 512 + offset;
+    
+    Serial.printf("SMB2: Reading sector LBA=%u, offset=%u, size=%u (abs_offset=%llu)\n", 
+                  lba, offset, bufsize, absoluteOffset);
+    
+    return readFromSMB2File(virtualDiskFileId, absoluteOffset, buffer, bufsize);
+}
+
+bool SMBClient::writeSector(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    if (!authenticated || !virtualDiskOpen) {
+        // Try to open virtual disk file if not already open
+        if (!openVirtualDiskFile()) {
+            Serial.println("SMB2: Cannot open virtual disk file for writing");
+            return false;
+        }
+    }
+    
+    // Calculate absolute offset in the virtual disk file
+    uint64_t absoluteOffset = (uint64_t)lba * 512 + offset;
+    
+    Serial.printf("SMB2: Writing sector LBA=%u, offset=%u, size=%u (abs_offset=%llu)\n", 
+                  lba, offset, bufsize, absoluteOffset);
+    
+    return writeToSMB2File(virtualDiskFileId, absoluteOffset, buffer, bufsize);
+}
+
+bool SMBClient::openVirtualDiskFile() {
+    if (virtualDiskOpen) {
+        return true;
+    }
+    
+    String virtualDiskPath = share_path + "virtual_disk.img";
+    Serial.printf("SMB2: Opening virtual disk file: %s\n", virtualDiskPath.c_str());
+    
+    if (createSMB2File(virtualDiskPath, virtualDiskFileId)) {
+        virtualDiskOpen = true;
+        Serial.println("SMB2: Virtual disk file opened successfully");
+        return true;
+    }
+    
+    Serial.println("SMB2: Failed to open virtual disk file");
+    return false;
+}
+
+bool SMBClient::createSMB2File(const String& filePath, uint8_t* fileId) {
+    uint8_t createPacket[512];
+    buildSMB2Header(createPacket, SMB2_CREATE, getNextMessageID(), sessionID, treeID);
+    
+    uint8_t* payload = createPacket + SMB2_HEADER_SIZE;
+    
+    // SMB2 CREATE Request structure (57 bytes minimum)
+    payload[0] = 57;  // Structure Size (low byte)
+    payload[1] = 0;   // Structure Size (high byte)
+    
+    // Security Flags (1 byte)
+    payload[2] = 0;
+    
+    // Requested Oplock Level (1 byte) - none
+    payload[3] = 0;
+    
+    // Impersonation Level (4 bytes) - Impersonation
+    payload[4] = 0x02;
+    payload[5] = 0x00;
+    payload[6] = 0x00;
+    payload[7] = 0x00;
+    
+    // SMB Create Flags (8 bytes) - zero
+    memset(&payload[8], 0, 8);
+    
+    // Reserved (8 bytes)
+    memset(&payload[16], 0, 8);
+    
+    // Desired Access (4 bytes) - Generic Read/Write
+    payload[24] = 0xC0;  // GENERIC_READ | GENERIC_WRITE
+    payload[25] = 0x01;
+    payload[26] = 0x00;
+    payload[27] = 0x00;
+    
+    // File Attributes (4 bytes) - Normal file
+    payload[28] = 0x80;
+    payload[29] = 0x00;
+    payload[30] = 0x00;
+    payload[31] = 0x00;
+    
+    // Share Access (4 bytes) - Read/Write
+    payload[32] = 0x03;  // FILE_SHARE_READ | FILE_SHARE_WRITE
+    payload[33] = 0x00;
+    payload[34] = 0x00;
+    payload[35] = 0x00;
+    
+    // Create Disposition (4 bytes) - Open if exists, create if not
+    payload[36] = 0x04;  // FILE_OPEN_IF
+    payload[37] = 0x00;
+    payload[38] = 0x00;
+    payload[39] = 0x00;
+    
+    // Create Options (4 bytes) - Non-directory file
+    payload[40] = 0x40;  // FILE_NON_DIRECTORY_FILE
+    payload[41] = 0x00;
+    payload[42] = 0x00;
+    payload[43] = 0x00;
+    
+    // Name Offset (2 bytes) - offset from SMB2 header start
+    uint16_t nameOffset = SMB2_HEADER_SIZE + 56;
+    payload[44] = nameOffset & 0xFF;
+    payload[45] = (nameOffset >> 8) & 0xFF;
+    
+    // Name Length (2 bytes) - UTF-16 length
+    uint16_t nameLength = filePath.length() * 2;
+    payload[46] = nameLength & 0xFF;
+    payload[47] = (nameLength >> 8) & 0xFF;
+    
+    // Create Context Offset (4 bytes) - zero (no contexts)
+    payload[48] = 0;
+    payload[49] = 0;
+    payload[50] = 0;
+    payload[51] = 0;
+    
+    // Create Context Length (4 bytes) - zero
+    payload[52] = 0;
+    payload[53] = 0;
+    payload[54] = 0;
+    payload[55] = 0;
+    
+    // File name in UTF-16LE
+    uint8_t* nameBuffer = payload + 56;
+    for (size_t i = 0; i < filePath.length(); i++) {
+        nameBuffer[i * 2] = filePath[i];
+        nameBuffer[i * 2 + 1] = 0;
+    }
+    
+    size_t totalSize = SMB2_HEADER_SIZE + 56 + nameLength;
+    
+    if (client.write(createPacket, totalSize) != totalSize) {
+        return false;
+    }
+    
+    delay(100);
+    
+    uint8_t response[512];
+    size_t responseSize = sizeof(response);
+    if (!receiveSMB2Response(response, responseSize)) {
+        return false;
+    }
+    
+    // Check response status
+    uint32_t status = response[8] | (response[9] << 8) | (response[10] << 16) | (response[11] << 24);
+    if (status != NT_STATUS_SUCCESS) {
+        Serial.printf("SMB2: CREATE failed with status: 0x%08X\n", status);
+        return false;
+    }
+    
+    // Extract File ID from CREATE response (16 bytes at offset 132 in response)
+    if (responseSize >= SMB2_HEADER_SIZE + 88) {
+        memcpy(fileId, &response[SMB2_HEADER_SIZE + 72], 16);
+        return true;
+    }
+    
+    return false;
+}
+
+bool SMBClient::readFromSMB2File(uint8_t* fileId, uint64_t offset, uint8_t* buffer, uint32_t length) {
+    uint8_t readPacket[256];
+    buildSMB2Header(readPacket, SMB2_READ, getNextMessageID(), sessionID, treeID);
+    
+    uint8_t* payload = readPacket + SMB2_HEADER_SIZE;
+    
+    // SMB2 READ Request structure (49 bytes)
+    payload[0] = 49;  // Structure Size (low byte)
+    payload[1] = 0;   // Structure Size (high byte)
+    
+    // Padding (1 byte)
+    payload[2] = 0;
+    
+    // Flags (1 byte)
+    payload[3] = 0;
+    
+    // Length (4 bytes)
+    payload[4] = length & 0xFF;
+    payload[5] = (length >> 8) & 0xFF;
+    payload[6] = (length >> 16) & 0xFF;
+    payload[7] = (length >> 24) & 0xFF;
+    
+    // Offset (8 bytes)
+    payload[8] = offset & 0xFF;
+    payload[9] = (offset >> 8) & 0xFF;
+    payload[10] = (offset >> 16) & 0xFF;
+    payload[11] = (offset >> 24) & 0xFF;
+    payload[12] = (offset >> 32) & 0xFF;
+    payload[13] = (offset >> 40) & 0xFF;
+    payload[14] = (offset >> 48) & 0xFF;
+    payload[15] = (offset >> 56) & 0xFF;
+    
+    // File ID (16 bytes)
+    memcpy(&payload[16], fileId, 16);
+    
+    // Minimum Count (4 bytes) - same as length
+    payload[32] = length & 0xFF;
+    payload[33] = (length >> 8) & 0xFF;
+    payload[34] = (length >> 16) & 0xFF;
+    payload[35] = (length >> 24) & 0xFF;
+    
+    // Channel (4 bytes) - main channel
+    payload[36] = 0;
+    payload[37] = 0;
+    payload[38] = 0;
+    payload[39] = 0;
+    
+    // Remaining Bytes (4 bytes) - zero
+    payload[40] = 0;
+    payload[41] = 0;
+    payload[42] = 0;
+    payload[43] = 0;
+    
+    // Read Channel Info Offset (2 bytes) - zero
+    payload[44] = 0;
+    payload[45] = 0;
+    
+    // Read Channel Info Length (2 bytes) - zero
+    payload[46] = 0;
+    payload[47] = 0;
+    
+    // Buffer (1 byte) - padding
+    payload[48] = 0;
+    
+    size_t totalSize = SMB2_HEADER_SIZE + 49;
+    
+    if (client.write(readPacket, totalSize) != totalSize) {
+        return false;
+    }
+    
+    delay(50);
+    
+    uint8_t response[8192];
+    size_t responseSize = sizeof(response);
+    if (!receiveSMB2Response(response, responseSize)) {
+        memset(buffer, 0, length);  // Return zeros on read failure
+        return true;  // Don't fail completely - just return empty data
+    }
+    
+    // Check response status
+    uint32_t status = response[8] | (response[9] << 8) | (response[10] << 16) | (response[11] << 24);
+    if (status != NT_STATUS_SUCCESS) {
+        memset(buffer, 0, length);  // Return zeros on read failure
+        return true;  // Don't fail completely
+    }
+    
+    // Extract data from READ response
+    if (responseSize >= SMB2_HEADER_SIZE + 16) {
+        uint16_t dataOffset = response[SMB2_HEADER_SIZE + 2] | (response[SMB2_HEADER_SIZE + 3] << 8);
+        uint32_t dataLength = response[SMB2_HEADER_SIZE + 4] | (response[SMB2_HEADER_SIZE + 5] << 8) |
+                             (response[SMB2_HEADER_SIZE + 6] << 16) | (response[SMB2_HEADER_SIZE + 7] << 24);
+        
+        if (dataLength > 0 && dataOffset > 0 && dataOffset < responseSize) {
+            uint32_t copyLength = min(dataLength, length);
+            memcpy(buffer, &response[dataOffset], copyLength);
+            if (copyLength < length) {
+                memset(&buffer[copyLength], 0, length - copyLength);  // Pad with zeros
+            }
+        } else {
+            memset(buffer, 0, length);
+        }
+    } else {
+        memset(buffer, 0, length);
+    }
+    
+    return true;
+}
+
+bool SMBClient::writeToSMB2File(uint8_t* fileId, uint64_t offset, uint8_t* buffer, uint32_t length) {
+    uint8_t writePacket[512 + 4096];  // Header + data
+    buildSMB2Header(writePacket, SMB2_WRITE, getNextMessageID(), sessionID, treeID);
+    
+    uint8_t* payload = writePacket + SMB2_HEADER_SIZE;
+    
+    // SMB2 WRITE Request structure (49 bytes + data)
+    payload[0] = 49;  // Structure Size (low byte)
+    payload[1] = 0;   // Structure Size (high byte)
+    
+    // Data Offset (2 bytes) - offset from SMB2 header start
+    uint16_t dataOffset = SMB2_HEADER_SIZE + 48;
+    payload[2] = dataOffset & 0xFF;
+    payload[3] = (dataOffset >> 8) & 0xFF;
+    
+    // Length (4 bytes)
+    payload[4] = length & 0xFF;
+    payload[5] = (length >> 8) & 0xFF;
+    payload[6] = (length >> 16) & 0xFF;
+    payload[7] = (length >> 24) & 0xFF;
+    
+    // Offset (8 bytes)
+    payload[8] = offset & 0xFF;
+    payload[9] = (offset >> 8) & 0xFF;
+    payload[10] = (offset >> 16) & 0xFF;
+    payload[11] = (offset >> 24) & 0xFF;
+    payload[12] = (offset >> 32) & 0xFF;
+    payload[13] = (offset >> 40) & 0xFF;
+    payload[14] = (offset >> 48) & 0xFF;
+    payload[15] = (offset >> 56) & 0xFF;
+    
+    // File ID (16 bytes)
+    memcpy(&payload[16], fileId, 16);
+    
+    // Channel (4 bytes) - main channel
+    payload[32] = 0;
+    payload[33] = 0;
+    payload[34] = 0;
+    payload[35] = 0;
+    
+    // Remaining Bytes (4 bytes) - zero
+    payload[36] = 0;
+    payload[37] = 0;
+    payload[38] = 0;
+    payload[39] = 0;
+    
+    // Write Channel Info Offset (2 bytes) - zero
+    payload[40] = 0;
+    payload[41] = 0;
+    
+    // Write Channel Info Length (2 bytes) - zero
+    payload[42] = 0;
+    payload[43] = 0;
+    
+    // Flags (4 bytes) - zero
+    payload[44] = 0;
+    payload[45] = 0;
+    payload[46] = 0;
+    payload[47] = 0;
+    
+    // Copy the data after the header
+    memcpy(&writePacket[dataOffset], buffer, length);
+    
+    size_t totalSize = dataOffset + length;
+    
+    if (client.write(writePacket, totalSize) != totalSize) {
+        return false;
+    }
+    
+    delay(50);
+    
+    uint8_t response[512];
+    size_t responseSize = sizeof(response);
+    if (!receiveSMB2Response(response, responseSize)) {
+        return false;
+    }
+    
+    // Check response status
+    uint32_t status = response[8] | (response[9] << 8) | (response[10] << 16) | (response[11] << 24);
+    if (status != NT_STATUS_SUCCESS) {
+        Serial.printf("SMB2: WRITE failed with status: 0x%08X\n", status);
+        return false;
+    }
+    
+    return true;
 }
